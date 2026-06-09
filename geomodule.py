@@ -3,16 +3,31 @@ import os
 import json
 import numpy as np
 from datetime import datetime
-from math import log, tan, radians, cos, pi, sqrt, sin
+from math import log, tan, radians, cos, pi, sqrt
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QFileDialog, QMessageBox, QProgressBar,
-                             QSlider, QCheckBox)
+                             QSlider, QCheckBox, QComboBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QImage, QFont
 import requests
 from io import BytesIO
+import tempfile
+import zipfile
+
+# Константы для API OpenTopography
+OPENTOPOGRAPHY_API_URL = "https://portal.opentopography.org/API/globaldem"
+
+# Доступные DEM-датасеты
+DEM_DATASETS = {
+    "SRTMGL3": "SRTM GL3 90m",
+    "SRTMGL1": "SRTM GL1 30m", 
+    "NASADEM": "NASADEM Global DEM 30m",
+    "COP30": "Copernicus Global DSM 30m",
+    "COP90": "Copernicus Global DSM 90m",
+    "AW3D30": "ALOS World 3D 30m"
+}
 
 def lat_lon_to_pixel_mercator(lat, lon, zoom):
     n = 2.0 ** zoom
@@ -30,68 +45,169 @@ def pil_image_to_qpixmap(pil_image):
     qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimage)
 
-def qpixmap_to_pil(pixmap):
-    """Конвертация QPixmap в PIL Image"""
-    qimage = pixmap.toImage()
-    width = qimage.width()
-    height = qimage.height()
+def parse_dem_from_bytes(data):
+    """Парсинг DEM данных из байтов (поддержка GeoTIFF и HGT)"""
+    import io
     
-    # Получаем данные изображения
-    ptr = qimage.bits()
-    ptr.setsize(qimage.byteCount())
-    arr = np.array(ptr).reshape(height, width, 4)  # RGBA
-    return Image.fromarray(arr, 'RGBA')
-
-class DEMGenerator:
-    @staticmethod
-    def generate_dem(width, height, center_lat, center_lon, scale_km=10):
-        dem_array = np.zeros((height, width))
-        scale_factor = 10.0 / scale_km
-        mountain_scale = 50 * scale_factor
-        hill_scale = 20 * scale_factor
-        river_scale = 30 * scale_factor
+    # Пробуем прочитать как GeoTIFF через PIL
+    try:
+        from PIL import Image as PILImage
+        import struct
         
-        for y in range(height):
-            for x in range(width):
-                nx, ny = x / width, y / height
-                dist_from_center = sqrt((nx - 0.5)**2 + (ny - 0.5)**2)
-                mountain = max(0, 1 - dist_from_center * (1.5 / scale_factor)) * 0.8
-                hills = (sin(nx * mountain_scale) * cos(ny * mountain_scale * 0.75) + 
-                        sin(nx * hill_scale * 2) * 0.3 + 
-                        cos(ny * hill_scale * 1.5) * 0.3) * 0.3
-                river_valley = abs(sin(nx * river_scale + ny * river_scale * 0.7)) * 0.2
-                noise = np.random.random() * (0.1 / sqrt(scale_factor))
-                elevation = mountain + hills + river_valley * 0.5 + noise
-                lat_factor = 1 - abs(center_lat) / 90
-                elevation = elevation * (0.5 + lat_factor * 0.5)
-                dem_array[y, x] = max(0, min(1, elevation))
+        # Сохраняем во временный файл для анализа
+        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        
+        # Читаем с помощью PIL и numpy
+        with PILImage.open(tmp_path) as img:
+            # Конвертируем в numpy array
+            dem_array = np.array(img)
+            
+            # Для GeoTIFF высоты могут быть в разных форматах
+            if dem_array.dtype == np.uint16:
+                # Преобразуем в метры (для SRTM)
+                dem_array = dem_array.astype(np.float32)
+            elif dem_array.dtype == np.int16:
+                dem_array = dem_array.astype(np.float32)
+            
+        os.unlink(tmp_path)
         return dem_array
+        
+    except Exception as e:
+        print(f"Ошибка чтения GeoTIFF: {e}")
+        
+        # Пробуем как бинарный HGT файл (SRTM)
+        try:
+            # HGT файлы имеют размер 1201x1201 или 3601x3601
+            size = int(sqrt(len(data) / 2))
+            if size in [1201, 3601]:
+                dem_array = np.frombuffer(data, dtype='>i2').reshape((size, size))
+                # Заменяем no-data значения (-32768) на NaN
+                dem_array = dem_array.astype(np.float32)
+                dem_array[dem_array == -32768] = np.nan
+                return dem_array
+        except:
+            pass
     
-    @staticmethod
-    def dem_to_colormap(dem_array):
-        height, width = dem_array.shape
-        colored = Image.new('RGBA', (width, height))
-        pixels = colored.load()
-        for y in range(height):
-            for x in range(width):
-                e = dem_array[y, x]
-                if e < 0.2: r, g, b = 50, 100, 200
-                elif e < 0.4:
-                    t = (e - 0.2) / 0.2
-                    r, g, b = int(100 + t * 50), int(150 + t * 50), int(100 + t * 30)
-                elif e < 0.6:
-                    t = (e - 0.4) / 0.2
-                    r, g, b = int(150 + t * 80), int(200 - t * 50), int(130 - t * 50)
-                elif e < 0.8:
-                    t = (e - 0.6) / 0.2
-                    r, g, b = int(230 - t * 50), int(150 - t * 50), int(80 - t * 30)
-                else:
-                    intensity = int(200 + (e - 0.8) / 0.2 * 55)
-                    r, g, b = intensity, intensity, intensity
-                pixels[x, y] = (r, g, b, 255)
-        return colored
+    return None
+
+class DEMDownloader(QThread):
+    """Поток для загрузки DEM с OpenTopography API"""
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object, float, float)
+    error = pyqtSignal(str)
+    
+    def __init__(self, lat, lon, size_km, dem_type, api_key):
+        super().__init__()
+        self.lat = lat
+        self.lon = lon
+        self.size_km = size_km
+        self.dem_type = dem_type
+        self.api_key = api_key
+    
+    def run(self):
+        try:
+            size_deg_lat = (self.size_km / 2) / 111.32
+            size_deg_lon = (self.size_km / 2) / (111.32 * cos(radians(self.lat)))
+            
+            south = self.lat - size_deg_lat
+            north = self.lat + size_deg_lat
+            west = self.lon - size_deg_lon
+            east = self.lon + size_deg_lon
+            
+            self.progress.emit(10)
+            
+            # Пробуем получить DEM в формате GeoTIFF
+            params = {
+                "demtype": self.dem_type,
+                "south": south,
+                "north": north,
+                "west": west,
+                "east": east,
+                "outputFormat": "GTiff",
+                "API_Key": self.api_key
+            }
+            
+            self.progress.emit(30)
+            
+            response = requests.get(OPENTOPOGRAPHY_API_URL, params=params, timeout=60)
+            
+            self.progress.emit(50)
+            
+            if response.status_code == 401:
+                # Пробуем с другим форматом
+                params["outputFormat"] = "AAIGrid"
+                response = requests.get(OPENTOPOGRAPHY_API_URL, params=params, timeout=60)
+                
+                if response.status_code == 401:
+                    self.error.emit("Ошибка авторизации: неверный API-ключ OpenTopography")
+                    return
+            
+            if response.status_code != 200:
+                self.error.emit(f"Ошибка API: {response.status_code}")
+                return
+            
+            self.progress.emit(70)
+            
+            # Парсим полученные данные
+            dem_array = parse_dem_from_bytes(response.content)
+            
+            if dem_array is None:
+                # Пробуем как текстовый AAIGrid
+                try:
+                    content_str = response.content.decode('utf-8')
+                    lines = content_str.strip().split('\n')
+                    
+                    # Парсим AAIGrid формат
+                    header = {}
+                    data_start = 0
+                    for i, line in enumerate(lines):
+                        if line.startswith('ncols'):
+                            header['ncols'] = int(line.split()[1])
+                        elif line.startswith('nrows'):
+                            header['nrows'] = int(line.split()[1])
+                        elif line.startswith('xllcorner'):
+                            header['xllcorner'] = float(line.split()[1])
+                        elif line.startswith('yllcorner'):
+                            header['yllcorner'] = float(line.split()[1])
+                        elif line.startswith('cellsize'):
+                            header['cellsize'] = float(line.split()[1])
+                        elif line.startswith('NODATA_value'):
+                            header['nodata'] = float(line.split()[1])
+                            data_start = i + 1
+                            break
+                    
+                    if header:
+                        # Читаем данные
+                        data_values = []
+                        for line in lines[data_start:]:
+                            data_values.extend([float(x) for x in line.split()])
+                        
+                        dem_array = np.array(data_values[:header['ncols'] * header['nrows']])
+                        dem_array = dem_array.reshape((header['nrows'], header['ncols']))
+                        
+                        # Заменяем no-data значения на NaN
+                        if 'nodata' in header:
+                            dem_array[dem_array == header['nodata']] = np.nan
+                        
+                except Exception as e:
+                    print(f"Ошибка парсинга AAIGrid: {e}")
+            
+            self.progress.emit(90)
+            
+            if dem_array is None or dem_array.size == 0:
+                self.error.emit("Не удалось распарсить DEM данные")
+                return
+            
+            self.progress.emit(100)
+            self.finished.emit(dem_array, south, north)
+            
+        except Exception as e:
+            self.error.emit(f"Ошибка загрузки DEM: {str(e)}")
 
 class MapDownloader(QThread):
+    """Поток для загрузки спутниковой карты"""
     progress = pyqtSignal(int)
     finished = pyqtSignal(object, float, float, int, float)
     error = pyqtSignal(str)
@@ -147,6 +263,66 @@ class MapDownloader(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+def array_to_colored_png(dem_array, min_elev=None, max_elev=None):
+    """Конвертация массива DEM в цветное PNG-изображение"""
+    if dem_array is None or dem_array.size == 0:
+        return None
+    
+    # Заменяем NaN на среднее значение
+    dem_array = np.nan_to_num(dem_array, nan=np.nanmean(dem_array))
+    
+    if min_elev is None:
+        min_elev = np.min(dem_array)
+    if max_elev is None:
+        max_elev = np.max(dem_array)
+    
+    if max_elev - min_elev < 0.01:
+        return None
+    
+    normalized = (dem_array - min_elev) / (max_elev - min_elev)
+    normalized = np.clip(normalized, 0, 1)
+    
+    height, width = normalized.shape
+    colored = Image.new('RGBA', (width, height))
+    pixels = colored.load()
+    
+    for y in range(height):
+        for x in range(width):
+            e = normalized[y, x]
+            
+            if e < 0.1:
+                r, g, b = 30, 80, 120
+            elif e < 0.25:
+                t = (e - 0.1) / 0.15
+                r, g, b = 60 + int(t * 40), 100 + int(t * 50), 80 + int(t * 40)
+            elif e < 0.5:
+                t = (e - 0.25) / 0.25
+                r, g, b = 100 + int(t * 60), 150 + int(t * 40), 120 - int(t * 20)
+            elif e < 0.75:
+                t = (e - 0.5) / 0.25
+                r, g, b = 160 + int(t * 60), 190 - int(t * 40), 100 - int(t * 20)
+            else:
+                t = (e - 0.75) / 0.25
+                intensity = 220 + int(t * 35)
+                r, g, b = intensity, intensity, intensity
+            
+            pixels[x, y] = (r, g, b, 255)
+    
+    return colored
+
+def save_dem_as_png(dem_array, filepath):
+    """Сохраняет DEM массив как PNG изображение"""
+    colored = array_to_colored_png(dem_array)
+    if colored:
+        colored.save(filepath, "PNG")
+        return True
+    return False
+
+def save_dem_as_npy(dem_array, filepath):
+    """Сохраняет DEM массив как NPY файл (numpy binary)"""
+    np.save(filepath, dem_array)
+    return True
+
 class MapPreviewArea(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -156,7 +332,6 @@ class MapPreviewArea(QLabel):
         self.setText("Загрузите спутниковую карту")
         self.satellite = None
         self.dem = None
-        self.combined = None
         self.lat = self.lon = None
         self.size_km = 10
         self.opacity = 0.4
@@ -167,8 +342,21 @@ class MapPreviewArea(QLabel):
         self.lat, self.lon, self.size_km = lat, lon, size_km
         self.update_display()
     
-    def set_dem(self, dem_image):
-        self.dem = dem_image
+    def set_dem(self, dem_array):
+        if dem_array is not None and dem_array.size > 0:
+            # Изменяем размер DEM под размер спутниковой карты
+            if dem_array.shape != (self.satellite.height(), self.satellite.width()):
+                # Ресайзим DEM массив
+                from scipy import ndimage
+                zoom_y = self.satellite.height() / dem_array.shape[0]
+                zoom_x = self.satellite.width() / dem_array.shape[1]
+                dem_array = ndimage.zoom(dem_array, (zoom_y, zoom_x), order=1)
+            
+            self.dem_array = dem_array
+            self.dem = array_to_colored_png(dem_array)
+        else:
+            self.dem = None
+            self.dem_array = None
         self.update_display()
     
     def set_opacity(self, opacity):
@@ -180,18 +368,19 @@ class MapPreviewArea(QLabel):
         self.update_display()
     
     def get_combined_image(self):
-        """Получить комбинированное изображение (спутник + DEM)"""
         if self.satellite is None:
             return None
         
-        # Создаем копию спутниковой карты
         result = QPixmap(self.satellite)
         
         if self.show_dem and self.dem is not None:
             painter = QPainter(result)
             painter.setOpacity(self.opacity)
-            dem_qimage = QImage(self.dem.tobytes("raw", "RGBA"), self.dem.width, self.dem.height, QImage.Format_RGBA8888)
-            dem_scaled = QPixmap.fromImage(dem_qimage).scaled(result.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            dem_qimage = QImage(self.dem.tobytes("raw", "RGBA"), 
+                               self.dem.width, self.dem.height, 
+                               QImage.Format_RGBA8888)
+            dem_pixmap = QPixmap.fromImage(dem_qimage)
+            dem_scaled = dem_pixmap.scaled(result.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             painter.drawPixmap(0, 0, dem_scaled)
             painter.end()
         
@@ -202,7 +391,6 @@ class MapPreviewArea(QLabel):
             return
         result = self.get_combined_image()
         
-        # Добавляем рамку и координаты
         painter = QPainter(result)
         painter.setPen(QPen(QColor(255, 0, 0), 2))
         painter.drawRect(0, 0, result.width() - 1, result.height() - 1)
@@ -214,8 +402,10 @@ class MapPreviewArea(QLabel):
         painter.drawText(10, 25, f"{self.lat:.4f}, {self.lon:.4f} | {self.size_km}×{self.size_km} км")
         painter.end()
         
-        self.combined = result
         self.setPixmap(result.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    
+    def get_dem_array(self):
+        return getattr(self, 'dem_array', None)
     
     def resizeEvent(self, event):
         if self.satellite:
@@ -225,16 +415,20 @@ class MapPreviewArea(QLabel):
 class SimpleMapApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Спутниковая карта + DEM")
-        self.setGeometry(100, 100, 800, 700)
+        self.setWindowTitle("Спутниковая карта + DEM (SRTM/NASADEM)")
+        self.setGeometry(100, 100, 900, 750)
         
         self.current_satellite = None
-        self.current_dem = None
+        self.current_dem_array = None
         self.current_lat = None
         self.current_lon = None
         self.current_size = 10
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
         self.downloader = None
+        self.dem_downloader = None
+        
+        # API ключ OpenTopography
+        self.api_key = "24d6c79232d14e0a759afb5979dbc4ec"
         
         self.setup_ui()
     
@@ -264,7 +458,7 @@ class SimpleMapApp(QMainWindow):
         coord_layout.addStretch()
         layout.addWidget(coord_widget)
         
-        # Панель управления масштабом
+        # Панель масштаба
         scale_widget = QWidget()
         scale_layout = QHBoxLayout(scale_widget)
         scale_layout.setContentsMargins(0, 0, 0, 0)
@@ -285,7 +479,21 @@ class SimpleMapApp(QMainWindow):
         scale_layout.addStretch()
         layout.addWidget(scale_widget)
         
-        # Панель DEM
+        # Панель DEM (выбор источника)
+        dem_source_widget = QWidget()
+        dem_source_layout = QHBoxLayout(dem_source_widget)
+        dem_source_layout.setContentsMargins(0, 0, 0, 0)
+        
+        dem_source_layout.addWidget(QLabel("Источник DEM:"))
+        self.dem_combo = QComboBox()
+        for key, name in DEM_DATASETS.items():
+            self.dem_combo.addItem(name, key)
+        dem_source_layout.addWidget(self.dem_combo)
+        
+        dem_source_layout.addStretch()
+        layout.addWidget(dem_source_widget)
+        
+        # Панель прозрачности
         dem_widget = QWidget()
         dem_layout = QHBoxLayout(dem_widget)
         dem_layout.setContentsMargins(0, 0, 0, 0)
@@ -316,7 +524,7 @@ class SimpleMapApp(QMainWindow):
         btn_layout = QHBoxLayout(btn_widget)
         btn_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.open_btn = QPushButton("Открыть спутниковую карту")
+        self.open_btn = QPushButton("Открыть спутниковую карту + DEM")
         self.open_btn.clicked.connect(self.open_map)
         self.open_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; padding: 5px; }")
         
@@ -342,7 +550,7 @@ class SimpleMapApp(QMainWindow):
         layout.addWidget(self.preview)
         
         # Статус
-        self.statusBar().showMessage("Готов")
+        self.statusBar().showMessage("Готов. API-ключ OpenTopography установлен")
     
     def on_scale_changed(self, value):
         self.scale_label.setText(f"{value} км")
@@ -373,7 +581,6 @@ class SimpleMapApp(QMainWindow):
             return
         
         size = self.current_size
-        # Автоподбор зума
         if size <= 5: zoom = 14
         elif size <= 10: zoom = 13
         elif size <= 20: zoom = 12
@@ -381,44 +588,74 @@ class SimpleMapApp(QMainWindow):
         else: zoom = 10
         
         self.open_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        self.statusBar().showMessage(f"Загрузка {size}×{size} км...")
+        
+        self.statusBar().showMessage(f"Загрузка спутниковой карты {size}×{size} км...")
         
         self.downloader = MapDownloader(lat, lon, zoom, size)
         self.downloader.progress.connect(self.progress.setValue)
-        self.downloader.finished.connect(self.on_map_loaded)
+        self.downloader.finished.connect(self.on_satellite_loaded)
         self.downloader.error.connect(self.on_map_error)
         self.downloader.start()
     
-    def on_map_loaded(self, pixmap, lat, lon, zoom, size):
+    def on_satellite_loaded(self, pixmap, lat, lon, zoom, size):
         self.current_satellite = pixmap
         self.current_lat, self.current_lon, self.current_size = lat, lon, size
         
-        self.statusBar().showMessage("Генерация рельефа...")
-        QApplication.processEvents()
+        self.statusBar().showMessage(f"Загрузка DEM с OpenTopography API...")
+        self.progress.setValue(0)
         
-        dem_array = DEMGenerator.generate_dem(pixmap.width(), pixmap.height(), lat, lon, size)
-        self.current_dem = DEMGenerator.dem_to_colormap(dem_array)
+        dem_type_key = self.dem_combo.currentData()
         
-        self.preview.set_map(pixmap, lat, lon, size)
-        self.preview.set_dem(self.current_dem)
+        self.dem_downloader = DEMDownloader(lat, lon, size, dem_type_key, self.api_key)
+        self.dem_downloader.progress.connect(self.progress.setValue)
+        self.dem_downloader.finished.connect(self.on_dem_loaded)
+        self.dem_downloader.error.connect(self.on_dem_error)
+        self.dem_downloader.start()
+    
+    def on_dem_loaded(self, dem_array, south, north):
+        self.current_dem_array = dem_array
         
-        self.save_btn.setEnabled(True)
+        self.preview.set_map(self.current_satellite, self.current_lat, self.current_lon, self.current_size)
+        self.preview.set_dem(dem_array)
+        
         self.progress.setVisible(False)
         self.open_btn.setEnabled(True)
-        self.statusBar().showMessage(f"Готово! {size}×{size} км")
+        self.save_btn.setEnabled(True)
         
-        QMessageBox.information(self, "Успех", f"Загружено {size}×{size} км\nЦентр: {lat:.4f}, {lon:.4f}")
+        if dem_array is not None and dem_array.size > 0:
+            min_elev = np.nanmin(dem_array)
+            max_elev = np.nanmax(dem_array)
+            mean_elev = np.nanmean(dem_array)
+            self.statusBar().showMessage(
+                f"Готово! {self.current_size}×{self.current_size} км, "
+                f"DEM: {min_elev:.0f}-{max_elev:.0f} м, средняя {mean_elev:.0f} м"
+            )
+            QMessageBox.information(self, "Успех", 
+                f"Загружено:\n"
+                f"Спутниковая карта: {self.current_size}×{self.current_size} км\n"
+                f"DEM: {DEM_DATASETS[self.dem_combo.currentData()]}\n"
+                f"Высоты: от {min_elev:.0f} до {max_elev:.0f} м")
+        else:
+            self.statusBar().showMessage(f"Готово! {self.current_size}×{self.current_size} км")
+    
+    def on_dem_error(self, error):
+        self.progress.setVisible(False)
+        self.open_btn.setEnabled(True)
+        self.preview.set_map(self.current_satellite, self.current_lat, self.current_lon, self.current_size)
+        self.save_btn.setEnabled(True)
+        self.statusBar().showMessage("Готово (DEM не загружен)")
+        QMessageBox.warning(self, "Предупреждение", f"Не удалось загрузить DEM:\n{error}")
     
     def on_map_error(self, error):
         self.progress.setVisible(False)
         self.open_btn.setEnabled(True)
         self.statusBar().showMessage("Ошибка загрузки")
-        QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить:\n{error}")
+        QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить карту:\n{error}")
     
     def save_map(self):
-        """Сохранение спутниковой карты, DEM и комбинированного изображения"""
         if self.current_satellite is None:
             QMessageBox.warning(self, "Ошибка", "Нет загруженной карты")
             return
@@ -430,71 +667,99 @@ class SimpleMapApp(QMainWindow):
         satellite_path = os.path.join(self.save_dir, f"{base}_satellite.png")
         self.current_satellite.save(satellite_path, "PNG")
         
-        # 2. Сохраняем DEM (рельеф)
-        dem_path = os.path.join(self.save_dir, f"{base}_dem.png")
-        if self.current_dem:
-            self.current_dem.save(dem_path, "PNG")
+        # 2. Сохраняем DEM как NPY и PNG
+        dem_npy_path = None
+        dem_png_path = None
         
-        # 3. Сохраняем комбинированное изображение (с наложением)
+        if self.current_dem_array is not None and self.current_dem_array.size > 0:
+            dem_npy_path = os.path.join(self.save_dir, f"{base}_dem.npy")
+            save_dem_as_npy(self.current_dem_array, dem_npy_path)
+            
+            dem_png_path = os.path.join(self.save_dir, f"{base}_dem.png")
+            save_dem_as_png(self.current_dem_array, dem_png_path)
+        
+        # 3. Сохраняем комбинированное изображение
         combined_path = os.path.join(self.save_dir, f"{base}_combined.png")
         combined_image = self.preview.get_combined_image()
         if combined_image:
             combined_image.save(combined_path, "PNG")
         
-        # 4. Сохраняем метаданные
+        # 4. Метаданные
         metadata = {
-            "type": "satellite_with_dem",
+            "type": "satellite_with_real_dem",
             "latitude": self.current_lat,
             "longitude": self.current_lon,
             "size_km": self.current_size,
             "download_date": datetime.now().isoformat(),
+            "dem_source": self.dem_combo.currentData(),
             "dem_opacity": self.opacity_slider.value() / 100.0,
             "show_dem": self.show_dem_cb.isChecked(),
             "files": {
                 "satellite": f"{base}_satellite.png",
-                "dem": f"{base}_dem.png",
                 "combined": f"{base}_combined.png"
             }
         }
+        
+        if dem_npy_path:
+            metadata["files"]["dem_npy"] = f"{base}_dem.npy"
+        if dem_png_path:
+            metadata["files"]["dem_png"] = f"{base}_dem.png"
         
         json_path = os.path.join(self.save_dir, f"{base}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
         
-        QMessageBox.information(self, "Сохранено", 
-                                f"Сохранены файлы:\n"
-                                f"• Спутниковая карта: {satellite_path}\n"
-                                f"• DEM рельеф: {dem_path}\n"
-                                f"• Комбинированная карта (с наложением): {combined_path}\n"
-                                f"• Метаданные: {json_path}")
+        msg = f"Сохранены файлы:\n• {satellite_path}\n• {combined_path}"
+        if dem_png_path:
+            msg += f"\n• {dem_png_path}"
+        if dem_npy_path:
+            msg += f"\n• {dem_npy_path}"
+        msg += f"\n• {json_path}"
+        
+        QMessageBox.information(self, "Сохранено", msg)
         self.statusBar().showMessage("Все файлы сохранены")
     
     def open_saved(self):
-        """Открытие сохраненной карты"""
         path, _ = QFileDialog.getOpenFileName(
-            self, 
-            "Выберите файл", 
-            self.save_dir, 
-            "Изображения (*.png);;Все файлы (*.*)"
+            self, "Выберите файл", self.save_dir, 
+            "Изображения (*.png);;NPY файлы (*.npy);;Все файлы (*.*)"
         )
         if not path:
             return
         
         try:
-            # Определяем тип файла по имени
-            filename = os.path.basename(path)
-            
-            if "_satellite" in filename:
-                # Загружаем спутниковую карту
+            if path.endswith('.npy'):
+                # Загружаем DEM из NPY
+                dem_array = np.load(path)
+                if dem_array is not None:
+                    self.current_dem_array = dem_array
+                    self.preview.set_dem(dem_array)
+                    
+                    # Пытаемся найти соответствующий JSON
+                    json_path = path.replace('.npy', '.json')
+                    if os.path.exists(json_path):
+                        with open(json_path, 'r') as f:
+                            meta = json.load(f)
+                        self.current_lat = meta.get('latitude', 0)
+                        self.current_lon = meta.get('longitude', 0)
+                        self.current_size = meta.get('size_km', 10)
+                        self.scale_slider.setValue(self.current_size)
+                        self.opacity_slider.setValue(int(meta.get('dem_opacity', 0.4) * 100))
+                        self.show_dem_cb.setChecked(meta.get('show_dem', True))
+                    
+                    self.statusBar().showMessage(f"Загружен DEM: {self.current_size}×{self.current_size} км")
+                    self.save_btn.setEnabled(True)
+                    return
+            else:
+                # Загружаем изображение
                 pixmap = QPixmap(path)
                 if pixmap.isNull():
                     QMessageBox.warning(self, "Ошибка", "Не удалось загрузить")
                     return
                 
-                # Ищем соответствующие файлы
-                base = filename.replace("_satellite.png", "")
-                dem_path = os.path.join(os.path.dirname(path), f"{base}_dem.png")
-                json_path = os.path.join(os.path.dirname(path), f"{base}.json")
+                json_path = path.replace('_satellite.png', '.json').replace('_combined.png', '.json')
+                if not os.path.exists(json_path):
+                    json_path = path.replace('.png', '.json')
                 
                 if os.path.exists(json_path):
                     with open(json_path, 'r') as f:
@@ -505,13 +770,15 @@ class SimpleMapApp(QMainWindow):
                     self.scale_slider.setValue(self.current_size)
                     self.opacity_slider.setValue(int(meta.get('dem_opacity', 0.4) * 100))
                     self.show_dem_cb.setChecked(meta.get('show_dem', True))
-                    
-                    # Загружаем DEM если есть
-                    if os.path.exists(dem_path):
-                        self.current_dem = Image.open(dem_path)
-                        self.preview.set_dem(self.current_dem)
-                    
                     self.statusBar().showMessage(f"Загружено: {self.current_size}×{self.current_size} км")
+                    
+                    # Загружаем DEM из NPY если есть
+                    dem_npy = meta.get('files', {}).get('dem_npy')
+                    if dem_npy:
+                        dem_path = os.path.join(os.path.dirname(path), dem_npy)
+                        if os.path.exists(dem_path):
+                            self.current_dem_array = np.load(dem_path)
+                            self.preview.set_dem(self.current_dem_array)
                 else:
                     self.current_lat = self.current_lon = 0
                     self.current_size = 10
@@ -519,19 +786,6 @@ class SimpleMapApp(QMainWindow):
                 self.current_satellite = pixmap
                 self.preview.set_map(pixmap, self.current_lat, self.current_lon, self.current_size)
                 self.save_btn.setEnabled(True)
-                
-            elif "_combined" in filename:
-                # Загружаем комбинированное изображение
-                pixmap = QPixmap(path)
-                if pixmap.isNull():
-                    QMessageBox.warning(self, "Ошибка", "Не удалось загрузить")
-                    return
-                
-                self.preview.setPixmap(pixmap.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                self.statusBar().showMessage("Загружено комбинированное изображение")
-                self.save_btn.setEnabled(True)
-            else:
-                QMessageBox.warning(self, "Ошибка", "Неизвестный тип файла")
             
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
