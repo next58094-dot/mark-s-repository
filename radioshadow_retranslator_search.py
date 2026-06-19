@@ -10,10 +10,12 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QMessageBox, QProgressBar,
                              QSlider, QCheckBox, QComboBox, QGroupBox,
                              QSpinBox, QDoubleSpinBox, QListWidget, QListWidgetItem,
-                             QSplitter, QTabWidget, QTextEdit, QProgressDialog)
+                             QSplitter, QTabWidget, QTextEdit, QProgressDialog,
+                             QDialog, QDialogButtonBox, QFormLayout)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint, QRectF, QTimer
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QImage, QFont, QBrush, QPolygonF
 import traceback
+import math
 
 # Константы
 OPENTOPOGRAPHY_API_URL = "https://portal.opentopography.org/API/globaldem"
@@ -57,8 +59,49 @@ def interpolate_points(lat1, lon1, lat2, lon2, num_points):
         result.append((lat, lon))
     return result
 
+class AltitudeInputDialog(QDialog):
+    """Диалог для ввода высоты полета для точки маршрута"""
+    def __init__(self, point_index, default_altitude=100, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Высота для точки {point_index + 1}")
+        self.setModal(True)
+        
+        layout = QVBoxLayout()
+        
+        info_label = QLabel(f"Введите высоту полета для точки {point_index + 1}\n(относительно точки старта, где 0 = высота старта)")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        form_layout = QFormLayout()
+        self.altitude_spin = QDoubleSpinBox()
+        self.altitude_spin.setRange(0, 2000)
+        self.altitude_spin.setValue(default_altitude)
+        self.altitude_spin.setSuffix(" м")
+        form_layout.addRow("Высота полета:", self.altitude_spin)
+        layout.addLayout(form_layout)
+        
+        # Добавляем информацию о текущей высоте земли
+        self.ground_info = QLabel()
+        self.ground_info.setStyleSheet("color: gray; font-size: 9pt;")
+        layout.addWidget(self.ground_info)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setLayout(layout)
+    
+    def get_altitude(self):
+        return self.altitude_spin.value()
+    
+    def set_ground_info(self, ground_abs, start_abs):
+        """Установка информации о высоте земли"""
+        rel_ground = ground_abs - start_abs
+        self.ground_info.setText(f"Высота земли в этой точке: {rel_ground:.0f} м относительно старта ({ground_abs:.0f} м над уровнем моря)")
+
 class RelaySearchThread(QThread):
-    """Поток для поиска ретранслятора"""
+    """Упрощенный и эффективный поток для поиска ретранслятора"""
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
     finished = pyqtSignal(object)
@@ -83,7 +126,7 @@ class RelaySearchThread(QThread):
         self._is_running = False
     
     def get_elevation_at(self, lat, lon):
-        """Получение высоты из DEM (без кэша для потока)"""
+        """Получение высоты из DEM"""
         if self.dem_array is None or self.bounds is None:
             return 0
         
@@ -140,129 +183,153 @@ class RelaySearchThread(QThread):
             start_lat, start_lon = self.start_point
             start_abs = self.start_abs_elev
             
-            # Получаем точки маршрута
+            self.status.emit("Генерация траектории...")
+            
+            # Получаем все точки траектории с детализацией
             route_points = []
-            self.status.emit("Генерация точек маршрута...")
-            
-            total_steps = 0
             for i in range(len(self.waypoints) - 1):
-                lat1, lon1, alt1 = self.waypoints[i]
-                lat2, lon2, alt2 = self.waypoints[i+1]
-                steps = max(10, int(calculate_distance(lat1, lon1, lat2, lon2) / 20))
-                total_steps += steps
-            
-            progress_counter = 0
-            
-            for i in range(len(self.waypoints) - 1):
-                if not self._is_running:
-                    self.finished.emit(None)
-                    return
-                    
                 lat1, lon1, alt_rel1 = self.waypoints[i]
                 lat2, lon2, alt_rel2 = self.waypoints[i+1]
-                steps = max(10, int(calculate_distance(lat1, lon1, lat2, lon2) / 20))
+                steps = max(30, int(calculate_distance(lat1, lon1, lat2, lon2) / 5))
                 
                 for j in range(steps + 1):
-                    if not self._is_running:
-                        self.finished.emit(None)
-                        return
-                        
                     t = j / steps
                     lat = lat1 + (lat2 - lat1) * t
                     lon = lon1 + (lon2 - lon1) * t
-                    alt_abs = start_abs + alt_rel1 + (alt_rel2 - alt_rel1) * t
+                    alt_rel = alt_rel1 + (alt_rel2 - alt_rel1) * t
+                    alt_abs = start_abs + alt_rel
                     route_points.append((lat, lon, alt_abs))
-                    
-                    progress_counter += 1
-                    if progress_counter % 10 == 0 and total_steps > 0:
-                        self.progress.emit(int(progress_counter / total_steps * 30))
             
             if not route_points:
                 self.finished.emit(None)
                 return
             
-            self.status.emit("Проверка видимости от оператора...")
+            self.status.emit("Поиск зон радиотени...")
+            self.progress.emit(20)
             
-            # Ищем точки с плохой видимостью
+            # Находим все точки в зоне радиотени
             shadow_points = []
-            total_points = len(route_points)
+            shadow_indices = []
             
-            for idx, (lat, lon, alt) in enumerate(route_points):
+            for idx, (lat, lon, alt_abs) in enumerate(route_points):
                 if not self._is_running:
                     self.finished.emit(None)
                     return
                     
                 if not self.check_line_of_sight(start_lat, start_lon, start_abs, 
-                                               lat, lon, alt, self.operator_antenna_height):
-                    shadow_points.append((lat, lon, alt))
+                                               lat, lon, alt_abs, self.operator_antenna_height):
+                    shadow_points.append((lat, lon, alt_abs))
+                    shadow_indices.append(idx)
                 
-                if idx % 5 == 0 and total_points > 0:
-                    self.progress.emit(30 + int(idx / total_points * 30))
+                if idx % 20 == 0:
+                    self.progress.emit(20 + int(idx / len(route_points) * 30))
             
             if not shadow_points:
                 self.status.emit("Зона радиотени не обнаружена")
                 self.finished.emit(None)
                 return
             
-            self.status.emit(f"Найдено {len(shadow_points)} точек в зоне тени. Поиск места для ретранслятора...")
+            self.status.emit(f"Найдено {len(shadow_points)} точек в зоне тени. Поиск ретранслятора...")
+            self.progress.emit(50)
             
-            # Создаем сетку кандидатов
-            candidates = []
-            step = max(5, int(len(route_points) / 20))
+            # Находим центр зоны тени
+            center_lat = sum(p[0] for p in shadow_points) / len(shadow_points)
+            center_lon = sum(p[1] for p in shadow_points) / len(shadow_points)
             
-            for idx in range(0, len(route_points), step):
-                if not self._is_running:
-                    self.finished.emit(None)
-                    return
-                    
-                lat, lon, alt = route_points[idx]
-                
-                if calculate_distance(start_lat, start_lon, lat, lon) < 100:
-                    continue
-                
-                if not self.check_line_of_sight(start_lat, start_lon, start_abs, 
-                                               lat, lon, alt, self.operator_antenna_height):
-                    continue
-                
-                candidates.append((lat, lon, alt))
-                if len(route_points) > 0:
-                    self.progress.emit(60 + int(idx / len(route_points) * 20))
+            # Определяем радиус поиска (расширяем область)
+            max_dist_to_center = 0
+            for lat, lon, alt in shadow_points:
+                dist = calculate_distance(center_lat, center_lon, lat, lon)
+                if dist > max_dist_to_center:
+                    max_dist_to_center = dist
             
-            if not candidates:
-                self.status.emit("Не найдено подходящих кандидатов")
-                self.finished.emit(None)
-                return
+            search_radius = max(max_dist_to_center * 2, 200)  # минимум 200 метров
             
-            # Оцениваем каждого кандидата
-            self.status.emit("Оценка кандидатов...")
+            self.status.emit(f"Поиск в радиусе {search_radius:.0f} м...")
+            
+            # Создаем сетку для поиска с переменным шагом
             best_relay = None
             best_coverage = 0
             
-            total_candidates = len(candidates)
-            for idx, (lat, lon, alt) in enumerate(candidates):
+            # Пробуем разные радиусы поиска
+            for radius_mult in [1.0, 1.5, 2.0, 3.0]:
                 if not self._is_running:
                     self.finished.emit(None)
                     return
                 
-                visible_count = 0
-                for shadow_lat, shadow_lon, shadow_alt in shadow_points:
-                    if self.check_line_of_sight(lat, lon, alt, 
-                                               shadow_lat, shadow_lon, shadow_alt, 
-                                               self.relay_antenna_height):
-                        visible_count += 1
+                current_radius = search_radius * radius_mult
+                step = max(20, current_radius / 10)  # Шаг поиска
                 
-                coverage = visible_count / len(shadow_points) if shadow_points else 0
+                # Поиск по спирали от центра
+                for angle in range(0, 360, 15):
+                    for r in range(0, int(current_radius), int(step)):
+                        if not self._is_running:
+                            self.finished.emit(None)
+                            return
+                        
+                        # Конвертируем полярные координаты в декартовы
+                        lat_offset = (r / 111320) * cos(radians(angle))
+                        lon_offset = (r / (111320 * cos(radians(center_lat)))) * sin(radians(angle))
+                        
+                        candidate_lat = center_lat + lat_offset
+                        candidate_lon = center_lon + lon_offset
+                        
+                        # Проверяем, что кандидат не слишком далеко от старта
+                        dist_from_start = calculate_distance(start_lat, start_lon, candidate_lat, candidate_lon)
+                        if dist_from_start > 8000:
+                            continue
+                        
+                        # Проверяем, что кандидат не слишком близко к старту
+                        if dist_from_start < 50:
+                            continue
+                        
+                        # Получаем высоту кандидата
+                        candidate_alt = self.get_elevation_at(candidate_lat, candidate_lon)
+                        
+                        # Проверяем видимость от старта до кандидата
+                        if not self.check_line_of_sight(start_lat, start_lon, start_abs, 
+                                                       candidate_lat, candidate_lon, candidate_alt, 
+                                                       self.operator_antenna_height):
+                            continue
+                        
+                        # Проверяем видимость от кандидата до точек тени
+                        visible_count = 0
+                        # Проверяем только часть точек для ускорения
+                        check_points = shadow_points[:min(50, len(shadow_points))]
+                        for shadow_lat, shadow_lon, shadow_alt in check_points:
+                            if self.check_line_of_sight(candidate_lat, candidate_lon, candidate_alt, 
+                                                       shadow_lat, shadow_lon, shadow_alt, 
+                                                       self.relay_antenna_height):
+                                visible_count += 1
+                        
+                        coverage = visible_count / len(check_points) if check_points else 0
+                        
+                        if coverage > best_coverage:
+                            best_coverage = coverage
+                            best_relay = (candidate_lat, candidate_lon)
+                        
+                        # Обновляем прогресс
+                        if int(r / step) % 5 == 0:
+                            progress = 50 + int((r / current_radius) * 40)
+                            self.progress.emit(min(progress, 90))
+            
+            # Если покрытие меньше 20%, пробуем поставить ретранслятор прямо в центре
+            if best_relay is None or best_coverage < 0.2:
+                self.status.emit("Попытка установки ретранслятора в центре зоны тени...")
                 
-                if coverage > best_coverage:
-                    best_coverage = coverage
-                    best_relay = (lat, lon)
+                center_alt = self.get_elevation_at(center_lat, center_lon)
                 
-                if idx % 2 == 0 and total_candidates > 0:
-                    self.progress.emit(80 + int(idx / total_candidates * 20))
+                # Проверяем, виден ли центр от старта
+                if self.check_line_of_sight(start_lat, start_lon, start_abs, 
+                                           center_lat, center_lon, center_alt, 
+                                           self.operator_antenna_height):
+                    best_relay = (center_lat, center_lon)
+                    best_coverage = 0.5
             
             self.status.emit(f"Поиск завершен. Покрытие: {best_coverage*100:.1f}%")
+            self.progress.emit(100)
             
-            if best_relay and best_coverage > 0.2:
+            if best_relay and best_coverage > 0.1:
                 self.finished.emit(best_relay)
             else:
                 self.finished.emit(None)
@@ -285,8 +352,8 @@ class MapWidget(QWidget):
         self.satellite_image = None
         self.dem_array = None
         self.bounds = None
-        self.waypoints = []
-        self.start_point = None
+        self.waypoints = []  # [(lat, lon, relative_altitude), ...]
+        self.start_point = None  # (lat, lon, abs_elevation)
         self.selected_point = -1
         self.dragging = False
         self.unsafe_points = set()
@@ -389,6 +456,7 @@ class MapWidget(QWidget):
                     
                     lat = lat1 + (lat2 - lat1) * t
                     lon = lon1 + (lon2 - lon1) * t
+                    # Абсолютная высота полета
                     alt = start_abs + flight_rel[i]
                 else:
                     lat, lon, alt = self.waypoints[-1][0], self.waypoints[-1][1], start_abs + flight_rel[i]
@@ -425,10 +493,12 @@ class MapWidget(QWidget):
                 if j == 0 and i > 0:
                     continue
                 
+                # Относительная высота земли
                 ground_abs = self.get_elevation_at(lat, lon)
                 ground_rel_val = ground_abs - start_abs
                 ground_rel.append(ground_rel_val)
                 
+                # Относительная высота полета (линейная интерполяция)
                 flight_rel_val = alt_rel1 + (alt_rel2 - alt_rel1) * t
                 flight_rel.append(flight_rel_val)
                 
@@ -524,6 +594,11 @@ class MapWidget(QWidget):
             painter.setPen(QPen(QColor(255, 255, 255), 2))
             painter.setFont(QFont("Arial", 10, QFont.Bold))
             painter.drawText(x - 5, y - 10, str(i + 1))
+            
+            # Отображаем высоту полета под точкой
+            painter.setPen(QPen(QColor(255, 255, 0), 1))
+            painter.setFont(QFont("Arial", 8))
+            painter.drawText(x - 20, y + 25, f"H={alt_rel:.0f}м")
     
     def mousePressEvent(self, event):
         if self.satellite_image is None:
@@ -612,7 +687,6 @@ class ProfileWidget(QWidget):
         self.min_safe_relative = []
         self.start_abs_elev = 0
         self.relay_point = None  # (dist, height) - расстояние и высота ретранслятора
-        self.start_point_abs = 0  # Абсолютная высота старта
         
     def set_data(self, distances, ground_rel, flight_rel, waypoint_indices, 
                  unsafe_indices, shadow_indices, start_abs_elev, min_clearance,
@@ -818,17 +892,18 @@ class ProfileWidget(QWidget):
 class RoutePlanner(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Планировщик маршрута БПЛА (относительные высоты)")
+        self.setWindowTitle("Планировщик маршрута БПЛА (индивидуальные высоты)")
         self.setGeometry(100, 100, 1400, 900)
         
         self.satellite_image = None
         self.dem_array = None
         self.bounds = None
         self.start_point = None
-        self.waypoints = []
+        self.waypoints = []  # [lat, lon, relative_altitude]
         self.start_abs_elev = 0
         self.shadow_indices = []
         self.relay_point = None
+        self.default_altitude = 100  # Высота по умолчанию
         
         self.search_thread = None
         self.progress_dialog = None
@@ -872,16 +947,21 @@ class RoutePlanner(QMainWindow):
         start_group.setLayout(start_layout)
         left_layout.addWidget(start_group)
         
-        flight_group = QGroupBox("Параметры полета")
-        flight_layout = QVBoxLayout()
+        # Настройка высоты по умолчанию
+        default_group = QGroupBox("Высота по умолчанию")
+        default_layout = QVBoxLayout()
+        default_layout.addWidget(QLabel("Высота полета для новых точек (отн. старта), м:"))
+        self.default_altitude_spin = QDoubleSpinBox()
+        self.default_altitude_spin.setRange(0, 2000)
+        self.default_altitude_spin.setValue(100)
+        self.default_altitude_spin.setSuffix(" м")
+        self.default_altitude_spin.valueChanged.connect(self.on_default_altitude_changed)
+        default_layout.addWidget(self.default_altitude_spin)
+        default_group.setLayout(default_layout)
+        left_layout.addWidget(default_group)
         
-        flight_layout.addWidget(QLabel("Высота полета (относительно старта), м:"))
-        self.altitude_spin = QDoubleSpinBox()
-        self.altitude_spin.setRange(0, 2000)
-        self.altitude_spin.setValue(200)
-        self.altitude_spin.setSuffix(" м")
-        self.altitude_spin.valueChanged.connect(self.on_flight_params_changed)
-        flight_layout.addWidget(self.altitude_spin)
+        flight_group = QGroupBox("Параметры безопасности")
+        flight_layout = QVBoxLayout()
         
         flight_layout.addWidget(QLabel("Минимальное расстояние до земли, м:"))
         self.min_clearance_spin = QDoubleSpinBox()
@@ -894,6 +974,7 @@ class RoutePlanner(QMainWindow):
         flight_group.setLayout(flight_layout)
         left_layout.addWidget(flight_group)
         
+        # Параметры радиосвязи
         radio_group = QGroupBox("Параметры радиосвязи")
         radio_layout = QVBoxLayout()
         
@@ -918,18 +999,23 @@ class RoutePlanner(QMainWindow):
         radio_group.setLayout(radio_layout)
         left_layout.addWidget(radio_group)
         
+        # Список точек
         points_group = QGroupBox("Точки маршрута")
         points_layout = QVBoxLayout()
         
         self.points_list = QListWidget()
         self.points_list.itemSelectionChanged.connect(self.on_point_selected)
+        self.points_list.itemDoubleClicked.connect(self.edit_point_altitude)
         points_layout.addWidget(self.points_list)
         
         points_btn_layout = QHBoxLayout()
+        self.edit_alt_btn = QPushButton("Изменить высоту")
+        self.edit_alt_btn.clicked.connect(self.edit_selected_point_altitude)
         self.delete_point_btn = QPushButton("Удалить точку")
         self.delete_point_btn.clicked.connect(self.delete_selected_point)
         self.clear_all_btn = QPushButton("Очистить все")
         self.clear_all_btn.clicked.connect(self.clear_all_points)
+        points_btn_layout.addWidget(self.edit_alt_btn)
         points_btn_layout.addWidget(self.delete_point_btn)
         points_btn_layout.addWidget(self.clear_all_btn)
         points_layout.addLayout(points_btn_layout)
@@ -937,6 +1023,7 @@ class RoutePlanner(QMainWindow):
         points_group.setLayout(points_layout)
         left_layout.addWidget(points_group)
         
+        # Проверка маршрута
         check_group = QGroupBox("Проверка маршрута")
         check_layout = QVBoxLayout()
         
@@ -953,6 +1040,7 @@ class RoutePlanner(QMainWindow):
         check_group.setLayout(check_layout)
         left_layout.addWidget(check_group)
         
+        # Поиск ретранслятора
         relay_group = QGroupBox("Поиск ретранслятора")
         relay_layout = QVBoxLayout()
         
@@ -992,6 +1080,9 @@ class RoutePlanner(QMainWindow):
         
         self.statusBar().showMessage("Загрузите карту, затем установите точку старта")
         self.waiting_for_start = False
+    
+    def on_default_altitude_changed(self):
+        self.default_altitude = self.default_altitude_spin.value()
     
     def on_flight_params_changed(self):
         if self.start_point and len(self.waypoints) >= 2:
@@ -1072,7 +1163,7 @@ class RoutePlanner(QMainWindow):
             self.waiting_for_start = False
             self.start_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
         else:
-            self.add_waypoint(lat, lon)
+            self.add_waypoint_with_dialog(lat, lon)
     
     def set_start_point(self, lat, lon):
         abs_elev = self.map_widget.get_elevation_at(lat, lon)
@@ -1089,26 +1180,74 @@ class RoutePlanner(QMainWindow):
                                f"Точка старта:\n"
                                f"Широта: {lat:.5f}\n"
                                f"Долгота: {lon:.5f}\n"
-                               f"Абсолютная высота: {abs_elev:.0f} м над уровнем моря")
+                               f"Абсолютная высота: {abs_elev:.0f} м над уровнем моря\n\n"
+                               f"Барометр обнулен. Теперь все высоты отсчитываются от этой точки.")
     
-    def add_waypoint(self, lat, lon):
+    def add_waypoint_with_dialog(self, lat, lon):
         if self.start_point is None:
             QMessageBox.warning(self, "Ошибка", "Сначала установите точку старта")
             return
         
+        # Показываем диалог для ввода высоты
+        dialog = AltitudeInputDialog(len(self.waypoints), self.default_altitude, self)
+        
+        # Показываем информацию о высоте земли
+        ground_abs = self.map_widget.get_elevation_at(lat, lon)
+        dialog.set_ground_info(ground_abs, self.start_abs_elev)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            altitude = dialog.get_altitude()
+            self.add_waypoint(lat, lon, altitude)
+    
+    def add_waypoint(self, lat, lon, relative_altitude=None):
+        if relative_altitude is None:
+            relative_altitude = self.default_altitude
+            
         ground_rel = self.map_widget.get_relative_ground_elevation(lat, lon)
-        flight_rel = self.altitude_spin.value()
-        clearance = flight_rel - ground_rel
         
-        self.waypoints.append([lat, lon, flight_rel])
-        self.map_widget.add_waypoint(lat, lon, flight_rel)
+        self.waypoints.append([lat, lon, relative_altitude])
+        self.map_widget.add_waypoint(lat, lon, relative_altitude)
         
-        item = QListWidgetItem(f"Точка {len(self.waypoints)}: {lat:.5f}, {lon:.5f}")
-        item.setToolTip(f"Высота земли: {ground_rel:.0f} м отн.\nВысота полета: {flight_rel:.0f} м отн.\nЗазор: {clearance:.0f} м")
+        clearance = relative_altitude - ground_rel
+        status = "🔴" if clearance < self.min_clearance_spin.value() else "✅"
+        
+        item = QListWidgetItem(f"{status} Точка {len(self.waypoints)}: H={relative_altitude:.0f}м")
+        item.setToolTip(f"Широта: {lat:.5f}\nДолгота: {lon:.5f}\nВысота земли: {ground_rel:.0f} м отн.\nВысота полета: {relative_altitude:.0f} м отн.\nЗазор: {clearance:.0f} м")
         self.points_list.addItem(item)
         
-        self.statusBar().showMessage(f"Добавлена точка {len(self.waypoints)}")
+        self.statusBar().showMessage(f"Добавлена точка {len(self.waypoints)}: высота={relative_altitude:.0f} м, зазор={clearance:.0f} м")
         self.update_profile()
+    
+    def edit_selected_point_altitude(self):
+        """Редактирование высоты выбранной точки"""
+        selected = self.points_list.currentRow()
+        if selected < 0 or selected >= len(self.waypoints):
+            QMessageBox.warning(self, "Ошибка", "Выберите точку для редактирования")
+            return
+        
+        lat, lon, current_alt = self.waypoints[selected]
+        
+        dialog = AltitudeInputDialog(selected, current_alt, self)
+        ground_abs = self.map_widget.get_elevation_at(lat, lon)
+        dialog.set_ground_info(ground_abs, self.start_abs_elev)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            new_altitude = dialog.get_altitude()
+            self.waypoints[selected][2] = new_altitude
+            self.map_widget.waypoints[selected][2] = new_altitude
+            
+            ground_rel = self.map_widget.get_relative_ground_elevation(lat, lon)
+            clearance = new_altitude - ground_rel
+            status = "🔴" if clearance < self.min_clearance_spin.value() else "✅"
+            
+            self.points_list.item(selected).setText(f"{status} Точка {selected+1}: H={new_altitude:.0f}м")
+            self.points_list.item(selected).setToolTip(f"Широта: {lat:.5f}\nДолгота: {lon:.5f}\nВысота земли: {ground_rel:.0f} м отн.\nВысота полета: {new_altitude:.0f} м отн.\nЗазор: {clearance:.0f} м")
+            
+            self.update_profile()
+    
+    def edit_point_altitude(self, index):
+        """Двойной клик для редактирования высоты"""
+        self.edit_selected_point_altitude()
     
     def move_waypoint(self, index, lat, lon):
         if index < len(self.waypoints):
@@ -1119,9 +1258,11 @@ class RoutePlanner(QMainWindow):
             
             ground_rel = self.map_widget.get_relative_ground_elevation(lat, lon)
             flight_rel = self.waypoints[index][2]
+            clearance = flight_rel - ground_rel
+            status = "🔴" if clearance < self.min_clearance_spin.value() else "✅"
             
-            self.points_list.item(index).setText(f"Точка {index+1}: {lat:.5f}, {lon:.5f}")
-            self.points_list.item(index).setToolTip(f"Высота земли: {ground_rel:.0f} м отн.\nВысота полета: {flight_rel:.0f} м отн.")
+            self.points_list.item(index).setText(f"{status} Точка {index+1}: H={flight_rel:.0f}м")
+            self.points_list.item(index).setToolTip(f"Широта: {lat:.5f}\nДолгота: {lon:.5f}\nВысота земли: {ground_rel:.0f} м отн.\nВысота полета: {flight_rel:.0f} м отн.\nЗазор: {clearance:.0f} м")
             
             self.update_profile()
     
@@ -1133,7 +1274,11 @@ class RoutePlanner(QMainWindow):
             self.points_list.takeItem(selected)
             
             for i in range(self.points_list.count()):
-                self.points_list.item(i).setText(f"Точка {i+1}: {self.waypoints[i][0]:.5f}, {self.waypoints[i][1]:.5f}")
+                lat, lon, alt = self.waypoints[i]
+                ground_rel = self.map_widget.get_relative_ground_elevation(lat, lon)
+                clearance = alt - ground_rel
+                status = "🔴" if clearance < self.min_clearance_spin.value() else "✅"
+                self.points_list.item(i).setText(f"{status} Точка {i+1}: H={alt:.0f}м")
             
             self.update_profile()
     
@@ -1211,6 +1356,7 @@ class RoutePlanner(QMainWindow):
         
         distances, ground_rel, flight_rel, waypoint_indices = self.map_widget.get_trajectory_profile()
         
+        # Проверяем безопасность высоты
         alt_violations = []
         for i in range(len(flight_rel)):
             clearance = flight_rel[i] - ground_rel[i]
@@ -1225,6 +1371,7 @@ class RoutePlanner(QMainWindow):
                     'deficit': self.min_clearance_spin.value() - clearance
                 })
         
+        # Проверяем зону радиотени
         shadow_indices = self.map_widget.check_shadow_zone(self.operator_antenna_spin.value())
         self.shadow_indices = shadow_indices
         self.update_profile()
@@ -1234,7 +1381,8 @@ class RoutePlanner(QMainWindow):
             msg = "❌ МАРШРУТ НЕБЕЗОПАСЕН!\n\n"
             
             if alt_violations:
-                msg += f"Найдено {len(alt_violations)} нарушений минимального расстояния до земли.\n"
+                msg += f"🔴 НАРУШЕНИЕ ВЫСОТЫ!\n"
+                msg += f"Найдено {len(alt_violations)} участков, где БПЛА врежется в землю!\n"
                 msg += f"Требуется зазор: {self.min_clearance_spin.value()} м\n\n"
             
             if shadow_indices:
@@ -1244,21 +1392,22 @@ class RoutePlanner(QMainWindow):
             msg += "Проблемные участки:\n"
             if alt_violations:
                 for v in alt_violations[:5]:
-                    msg += f"• Высота: на {v['dist']:.1f} км, земля={v['ground']:.0f} м, "
-                    msg += f"БПЛА={v['flight']:.0f} м, зазор={v['clearance']:.0f} м "
-                    msg += f"(не хватает {v['deficit']:.0f} м)\n"
+                    msg += f"💥 Столкновение: на {v['dist']:.1f} км, земля={v['ground']:.0f} м, "
+                    msg += f"БПЛА={v['flight']:.0f} м (не хватает {v['deficit']:.0f} м высоты!)\n"
             
             if shadow_indices:
-                msg += f"\n• Зона радиотени обнаружена на траектории.\n"
+                msg += f"\n📡 Зона радиотени обнаружена на траектории.\n"
                 if self.relay_point:
                     msg += f"✅ Предлагаемое место для ретранслятора:\n"
                     msg += f"  Широта: {self.relay_point[0]:.5f}\n"
                     msg += f"  Долгота: {self.relay_point[1]:.5f}\n"
                     msg += f"  Расстояние от старта: {calculate_distance(self.start_point[0], self.start_point[1], self.relay_point[0], self.relay_point[1]):.0f} м\n"
+                else:
+                    msg += f"⚠️ Ретранслятор не найден. Попробуйте увеличить высоту антенн.\n"
             
             self.result_text.setText(msg)
-            self.statusBar().showMessage("Маршрут небезопасен")
-            QMessageBox.warning(self, "Результат проверки", msg)
+            self.statusBar().showMessage("Маршрут небезопасен!")
+            QMessageBox.critical(self, "Результат проверки", msg)
         else:
             self.result_text.setStyleSheet("color: green;")
             min_clearance = min([flight_rel[i] - ground_rel[i] for i in range(len(flight_rel))])
@@ -1266,6 +1415,7 @@ class RoutePlanner(QMainWindow):
             msg += f"Минимальный зазор: {min_clearance:.0f} м\n"
             msg += f"Требуемый зазор: {self.min_clearance_spin.value()} м\n"
             msg += f"Радиосвязь: прямая видимость на всей траектории\n"
+            msg += f"Высота старта: {self.start_abs_elev:.0f} м над уровнем моря"
             self.result_text.setText(msg)
             self.statusBar().showMessage("Маршрут безопасен")
             QMessageBox.information(self, "Результат проверки", msg)
@@ -1365,20 +1515,23 @@ class RoutePlanner(QMainWindow):
                 self.update_profile()
                 
                 QMessageBox.information(self, "Ретранслятор найден",
-                                       f"Оптимальное место для ретранслятора:\n\n"
+                                       f"✅ Ретранслятор успешно найден!\n\n"
                                        f"Широта: {relay_pos[0]:.5f}\n"
                                        f"Долгота: {relay_pos[1]:.5f}\n"
                                        f"Расстояние от старта: {dist:.0f} м\n"
                                        f"Высота над уровнем моря: {elev:.0f} м")
             else:
-                self.relay_info_label.setText("❌ Не удалось найти подходящее место для ретранслятора\nПопробуйте изменить параметры антенн")
+                self.relay_info_label.setText("❌ Не удалось найти подходящее место\nПопробуйте увеличить высоту антенн")
                 self.relay_info_label.setStyleSheet("color: red; font-weight: bold;")
                 QMessageBox.warning(self, "Ретранслятор не найден",
-                                   "Не удалось найти подходящее место для установки ретранслятора.\n"
+                                   "Не удалось найти подходящее место.\n\n"
                                    "Попробуйте:\n"
-                                   "- Увеличить высоту антенн\n"
-                                   "- Изменить маршрут\n"
-                                   "- Сократить расстояние")
+                                   "1. Увеличить высоту антенны оператора (сейчас {:.1f} м)\n"
+                                   "2. Увеличить высоту антенны ретранслятора (сейчас {:.1f} м)\n"
+                                   "3. Изменить маршрут, чтобы уменьшить зону радиотени".format(
+                                       self.operator_antenna_spin.value(),
+                                       self.relay_antenna_spin.value()
+                                   ))
         except Exception as e:
             error_msg = f"Ошибка при обработке результата:\n{str(e)}\n{traceback.format_exc()}"
             QMessageBox.critical(self, "Ошибка", error_msg)
@@ -1405,7 +1558,7 @@ class RoutePlanner(QMainWindow):
                     'waypoints': self.waypoints,
                     'start_abs_elev': self.start_abs_elev,
                     'relay_point': self.relay_point,
-                    'altitude': self.altitude_spin.value(),
+                    'default_altitude': self.default_altitude,
                     'min_clearance': self.min_clearance_spin.value(),
                     'operator_antenna': self.operator_antenna_spin.value(),
                     'relay_antenna': self.relay_antenna_spin.value()
