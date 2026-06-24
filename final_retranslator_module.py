@@ -129,7 +129,7 @@ class RelaySearchThread(QThread):
         self._is_running = False
     
     def get_elevation_at(self, lat, lon):
-        """Получение высоты из DEM с кэшированием"""
+        """Получение высоты из DEM с кэшированием и проверкой границ"""
         cache_key = (round(lat, 6), round(lon, 6))
         if cache_key in self.elevation_cache:
             return self.elevation_cache[cache_key]
@@ -140,12 +140,18 @@ class RelaySearchThread(QThread):
         min_lon, max_lon, min_lat, max_lat = self.bounds
         h, w = self.dem_array.shape
         
+        # Проверка границ
+        if lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon:
+            self.elevation_cache[cache_key] = 0
+            return 0
+        
         x = (lon - min_lon) / (max_lon - min_lon) * (w - 1)
         y = (max_lat - lat) / (max_lat - min_lat) * (h - 1)
         
         x0, y0 = int(x), int(y)
         x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
         
+        # Проверка выхода за границы массива
         if x0 < 0 or x0 >= w or y0 < 0 or y0 >= h:
             self.elevation_cache[cache_key] = 0
             return 0
@@ -390,8 +396,9 @@ class MapWidget(QWidget):
         self.shadow_after_relay_points = set()
         self.relay_point = None
         self.first_waypoint_distance = 0
-        self.current_distances = []
+        self.current_distances = []  # Расстояния вдоль траектории
         self.manual_relay_mode = False
+        self.trajectory_distances = []  # Накопленные расстояния вдоль траектории
         
     def set_map(self, pixmap, dem_array, bounds):
         self.satellite_image = pixmap
@@ -413,10 +420,16 @@ class MapWidget(QWidget):
         self.update()
     
     def get_elevation_at(self, lat, lon):
+        """Получение высоты из DEM с проверкой границ"""
         if self.dem_array is None or self.bounds is None:
             return 0
         
         min_lon, max_lon, min_lat, max_lat = self.bounds
+        
+        # Проверка границ
+        if lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon:
+            return 0
+        
         h, w = self.dem_array.shape
         
         x = (lon - min_lon) / (max_lon - min_lon) * (w - 1)
@@ -425,6 +438,7 @@ class MapWidget(QWidget):
         x0, y0 = int(x), int(y)
         x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
         
+        # Проверка выхода за границы массива
         if x0 < 0 or x0 >= w or y0 < 0 or y0 >= h:
             return 0
         
@@ -444,6 +458,7 @@ class MapWidget(QWidget):
         return abs_ground - start_abs
     
     def check_line_of_sight(self, lat1, lon1, alt1, lat2, lon2, alt2, antenna_height=2):
+        """Проверка прямой видимости с учетом рельефа"""
         if self.dem_array is None or self.bounds is None:
             return True
         
@@ -512,8 +527,11 @@ class MapWidget(QWidget):
         relay_abs = self.get_elevation_at(relay_lat, relay_lon)
         dist_to_relay = calculate_distance(start_lat, start_lon, relay_lat, relay_lon)
         
-        # Радиус действия ретранслятора (1.5 радиуса от старта)
-        relay_radius = dist_to_relay * 1.5
+        # Радиус действия ретранслятора с учетом высоты
+        relay_height_above_ground = relay_abs - self.get_elevation_at(relay_lat, relay_lon)
+        # Упрощенный расчет радиуса: чем выше ретранслятор, тем больше радиус
+        relay_radius = dist_to_relay * (1 + relay_height_above_ground / 100)
+        relay_radius = min(relay_radius, dist_to_relay * 2)  # Ограничиваем максимум
         
         for i in range(len(flight_rel)):
             if len(self.waypoints) > 1:
@@ -556,20 +574,16 @@ class MapWidget(QWidget):
             else:
                 has_visibility = has_los_from_start
             
-            # Если точка ДО ретранслятора и нет видимости от старта - тень ДО
+            # Определяем зону тени
             if dist_from_start <= dist_to_relay and not has_visibility:
                 shadow_indices.append(i)
-            # Если точка ПОСЛЕ ретранслятора и нет видимости (ни от старта, ни от ретранслятора)
             elif dist_from_start > dist_to_relay and not has_visibility:
                 shadow_after_relay.append(i)
-            # Если точка ДО ретранслятора, но видна только от ретранслятора (ретранслятор работает назад)
-            elif dist_from_start <= dist_to_relay and has_los_from_relay and not has_los_from_start:
-                # Это нормально - ретранслятор покрывает зону назад
-                pass
         
         return shadow_indices, shadow_after_relay
     
     def get_trajectory_profile(self):
+        """Получение профиля траектории с корректным расчетом расстояний"""
         if len(self.waypoints) < 2 or self.start_point is None:
             return [], [], [], []
         
@@ -580,44 +594,62 @@ class MapWidget(QWidget):
         start_abs = self.start_point[2]
         start_lat, start_lon, _ = self.start_point
         
-        self.current_distances = [0.0]
+        # Массив для хранения расстояний вдоль траектории
+        self.trajectory_distances = [0.0]
         
+        # Расстояние до первой точки маршрута
         if len(self.waypoints) >= 1:
             first_lat, first_lon, _ = self.waypoints[0]
             self.first_waypoint_distance = calculate_distance(start_lat, start_lon, first_lat, first_lon)
+        
+        accumulated_dist = 0.0
         
         for i in range(len(self.waypoints) - 1):
             lat1, lon1, alt_rel1 = self.waypoints[i]
             lat2, lon2, alt_rel2 = self.waypoints[i + 1]
             
-            steps = max(20, int(calculate_distance(lat1, lon1, lat2, lon2) / 30))
+            total_segment_dist = calculate_distance(lat1, lon1, lat2, lon2)
+            steps = max(20, int(total_segment_dist / 30))
+            
+            # Координаты предыдущей точки для расчета расстояния
+            prev_lat, prev_lon = lat1, lon1
             
             for j in range(1, steps + 1):
                 t = j / steps
                 lat = lat1 + (lat2 - lat1) * t
                 lon = lon1 + (lon2 - lon1) * t
                 
+                # Относительная высота земли
                 ground_abs = self.get_elevation_at(lat, lon)
                 ground_rel_val = ground_abs - start_abs
                 ground_rel.append(ground_rel_val)
                 
+                # Относительная высота полета (линейная интерполяция)
                 flight_rel_val = alt_rel1 + (alt_rel2 - alt_rel1) * t
                 flight_rel.append(flight_rel_val)
                 
-                dist = calculate_distance(start_lat, start_lon, lat, lon) / 1000
-                distances.append(dist)
-                self.current_distances.append(dist)
+                # Расчет расстояния от предыдущей точки
+                segment_dist = calculate_distance(prev_lat, prev_lon, lat, lon) / 1000
+                accumulated_dist += segment_dist
+                distances.append(accumulated_dist)
+                self.trajectory_distances.append(accumulated_dist)
+                
+                prev_lat, prev_lon = lat, lon
             
             waypoint_indices.append(len(ground_rel) - 1)
         
         return distances, ground_rel, flight_rel, waypoint_indices
     
     def get_safe_indices(self, flight_rel, ground_rel, min_clearance):
+        """Получение индексов безопасных точек (исключая взлетный участок)"""
         unsafe_indices = []
+        
+        # Расстояние до первой точки маршрута в км
         first_waypoint_dist_km = self.first_waypoint_distance / 1000
         
         for i in range(len(flight_rel)):
-            if i < len(self.current_distances) and self.current_distances[i] <= first_waypoint_dist_km:
+            # Пропускаем взлетный участок (от старта до первой точки)
+            if i < len(self.trajectory_distances) and self.trajectory_distances[i] <= first_waypoint_dist_km:
                 continue
             
             if flight_rel[i] - ground_rel[i] < min_clearance:
@@ -705,10 +737,11 @@ class MapWidget(QWidget):
             if self.start_point:
                 start_lat, start_lon, _ = self.start_point
                 dist_to_relay = calculate_distance(start_lat, start_lon, self.relay_point[0], self.relay_point[1])
-                relay_radius = dist_to_relay * 1.5
+                relay_height_above_ground = relay_alt - self.get_elevation_at(self.relay_point[0], self.relay_point[1])
+                relay_radius = dist_to_relay * (1 + relay_height_above_ground / 100)
+                relay_radius = min(relay_radius, dist_to_relay * 2)
                 
                 # Конвертируем радиус в пиксели
-                # Приблизительный расчет: 1 градус ~ 111 км
                 radius_deg = relay_radius / 111000
                 center_lat = self.relay_point[0]
                 center_lon = self.relay_point[1]
@@ -904,12 +937,13 @@ class ProfileWidget(QWidget):
         self.first_waypoint_dist_km = 0
         self.shadow_zones = []
         self.relay_altitude = 0
+        self.relay_radius_km = 0
         
     def set_data(self, distances, ground_rel, flight_rel, waypoint_indices, 
                  unsafe_indices, shadow_indices, shadow_after_relay,
                  start_abs_elev, min_clearance, first_waypoint_dist_km=0,
                  relay_point=None, relay_position_km=None, shadow_zones=None,
-                 relay_altitude=0):
+                 relay_altitude=0, relay_radius_km=0):
         self.distances = distances
         self.ground_rel = ground_rel
         self.flight_rel = flight_rel
@@ -924,6 +958,7 @@ class ProfileWidget(QWidget):
         self.first_waypoint_dist_km = first_waypoint_dist_km
         self.shadow_zones = shadow_zones if shadow_zones else []
         self.relay_altitude = relay_altitude
+        self.relay_radius_km = relay_radius_km
         self.update()
     
     def paintEvent(self, event):
@@ -1069,14 +1104,13 @@ class ProfileWidget(QWidget):
             painter.drawText(x_relay + 10, y_relay + 20, f"Высота: {self.relay_altitude:.0f}м")
             
             # Рисуем радиус действия ретранслятора на графике
-            if self.relay_position_km:
-                relay_radius_km = self.relay_position_km * 1.5
-                x_radius_end, _ = map_point(relay_radius_km, 0)
+            if self.relay_radius_km > 0:
+                x_radius_end, _ = map_point(self.relay_radius_km, 0)
                 painter.setPen(QPen(QColor(255, 165, 0, 80), 1, Qt.DashLine))
                 painter.drawLine(x_relay, int(margins.top()), x_radius_end, int(margins.bottom()))
                 painter.setPen(QPen(QColor(255, 165, 0), 1))
                 painter.setFont(QFont("Arial", 7))
-                painter.drawText(x_radius_end + 5, int(margins.top()) + 15, f"Радиус {relay_radius_km:.1f} км")
+                painter.drawText(x_radius_end + 5, int(margins.top()) + 15, f"Радиус {self.relay_radius_km:.1f} км")
             
             if self.shadow_zones:
                 first_zone = self.shadow_zones[0]
@@ -1195,6 +1229,7 @@ class RoutePlanner(QMainWindow):
         self.relay_position_km = None
         self.first_waypoint_dist_km = 0
         self.relay_altitude = 0
+        self.relay_radius_km = 0
         
         self.search_thread = None
         self.progress_dialog = None
@@ -1618,6 +1653,7 @@ class RoutePlanner(QMainWindow):
         self.shadow_zones = []
         self.relay_position_km = None
         self.relay_altitude = 0
+        self.relay_radius_km = 0
         self.relay_info_label.setText("Ретранслятор не установлен")
         self.relay_info_label.setStyleSheet("color: gray; font-weight: bold;")
         self.update_profile()
@@ -1649,6 +1685,8 @@ class RoutePlanner(QMainWindow):
         relay_info = None
         relay_position_km = None
         relay_altitude = 0
+        relay_radius_km = 0
+        
         if self.relay_point is not None:
             start_lat, start_lon = self.start_point
             relay_lat, relay_lon = self.relay_point
@@ -1659,6 +1697,12 @@ class RoutePlanner(QMainWindow):
             relay_altitude = relay_height - self.start_abs_elev
             self.relay_altitude = relay_altitude
             
+            # Расчет радиуса действия ретранслятора
+            relay_height_above_ground = relay_height - self.map_widget.get_elevation_at(relay_lat, relay_lon)
+            relay_radius_km = relay_dist * (1 + relay_height_above_ground / 100)
+            relay_radius_km = min(relay_radius_km, relay_dist * 2)
+            self.relay_radius_km = relay_radius_km
+            
             # Проверяем, осталась ли зона радиотени после ретранслятора
             if shadow_after_relay:
                 self.relay_info_label.setText(
@@ -1666,7 +1710,8 @@ class RoutePlanner(QMainWindow):
                     f"Расстояние: {relay_position_km:.1f} км\n"
                     f"Высота: {relay_altitude:.0f} м\n"
                     f"Широта: {self.relay_point[0]:.5f}\n"
-                    f"Долгота: {self.relay_point[1]:.5f}\n\n"
+                    f"Долгота: {self.relay_point[1]:.5f}\n"
+                    f"Радиус: {relay_radius_km:.1f} км\n\n"
                     f"⚠️ Осталось {len(shadow_after_relay)} участков тени\n"
                     f"💡 Переместите ретранслятор для улучшения"
                 )
@@ -1677,7 +1722,8 @@ class RoutePlanner(QMainWindow):
                     f"Расстояние: {relay_position_km:.1f} км\n"
                     f"Высота: {relay_altitude:.0f} м\n"
                     f"Широта: {self.relay_point[0]:.5f}\n"
-                    f"Долгота: {self.relay_point[1]:.5f}\n\n"
+                    f"Долгота: {self.relay_point[1]:.5f}\n"
+                    f"Радиус: {relay_radius_km:.1f} км\n\n"
                     f"✅ Полное покрытие!\n"
                     f"💡 Перетащите для точной настройки"
                 )
@@ -1731,7 +1777,7 @@ class RoutePlanner(QMainWindow):
                                      self.start_abs_elev, self.min_clearance_spin.value(),
                                      first_waypoint_dist_km,
                                      relay_info, relay_position_km, shadow_zones,
-                                     relay_altitude)
+                                     relay_altitude, relay_radius_km)
         
         # Обновляем карту
         shadow_waypoints = set()
@@ -1882,7 +1928,7 @@ class RoutePlanner(QMainWindow):
                 msg += f"📡 Ретранслятор обеспечивает полное покрытие по радиусу!\n"
                 msg += f"  Расстояние от старта: {self.relay_position_km:.1f} км\n"
                 msg += f"  Высота: {self.relay_altitude:.0f} м относительно старта\n"
-                msg += f"  Радиус действия: {self.relay_position_km * 1.5:.1f} км\n"
+                msg += f"  Радиус действия: {self.relay_radius_km:.1f} км\n"
                 msg += f"💡 Перетащите ретранслятор для точной настройки\n"
             else:
                 msg += f"Радиосвязь: прямая видимость на всей траектории (ретранслятор не требуется)\n"
@@ -1976,13 +2022,18 @@ class RoutePlanner(QMainWindow):
                 relay_rel_alt = relay_abs_alt - self.start_abs_elev
                 self.relay_altitude = relay_rel_alt
                 
+                # Расчет радиуса действия ретранслятора
+                relay_height_above_ground = relay_abs_alt - self.map_widget.get_elevation_at(relay_pos[0], relay_pos[1])
+                self.relay_radius_km = self.relay_position_km * (1 + relay_height_above_ground / 100)
+                self.relay_radius_km = min(self.relay_radius_km, self.relay_position_km * 2)
+                
                 self.relay_info_label.setText(
                     f"✅ Ретранслятор найден на наивысшей точке!\n"
                     f"Расстояние от старта: {self.relay_position_km:.1f} км\n"
                     f"Высота: {relay_rel_alt:.0f} м относительно старта\n"
                     f"Широта: {relay_pos[0]:.5f}\n"
-                    f"Долгота: {relay_pos[1]:.5f}\n\n"
-                    f"📡 Радиус действия: {self.relay_position_km * 1.5:.1f} км\n"
+                    f"Долгота: {relay_pos[1]:.5f}\n"
+                    f"Радиус: {self.relay_radius_km:.1f} км\n\n"
                     f"💡 Перетащите ретранслятор для точной настройки"
                 )
                 self.relay_info_label.setStyleSheet("color: green; font-weight: bold;")
@@ -2002,7 +2053,7 @@ class RoutePlanner(QMainWindow):
                                           f"Высота: {relay_rel_alt:.0f} м относительно старта\n"
                                           f"Широта: {relay_pos[0]:.5f}\n"
                                           f"Долгота: {relay_pos[1]:.5f}\n"
-                                          f"Радиус действия: {self.relay_position_km * 1.5:.1f} км\n\n"
+                                          f"Радиус действия: {self.relay_radius_km:.1f} км\n\n"
                                           f"⚠️ Однако {len(shadow_after)} участков все еще в зоне радиотени.\n"
                                           f"💡 Попробуйте переместить ретранслятор перетаскиванием\n"
                                           f"для полного покрытия.")
@@ -2013,7 +2064,7 @@ class RoutePlanner(QMainWindow):
                                           f"Высота: {relay_rel_alt:.0f} м относительно старта\n"
                                           f"Широта: {relay_pos[0]:.5f}\n"
                                           f"Долгота: {relay_pos[1]:.5f}\n"
-                                          f"Радиус действия: {self.relay_position_km * 1.5:.1f} км\n\n"
+                                          f"Радиус действия: {self.relay_radius_km:.1f} км\n\n"
                                           f"📡 Полное покрытие радиосигналом!\n"
                                           f"💡 Перетащите ретранслятор для точной настройки")
             else:
